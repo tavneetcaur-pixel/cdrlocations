@@ -1,0 +1,166 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>CDR Travel Plotter — demo</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    html,body,#map{height:100%;margin:0;padding:0}
+    #controls{position:absolute;top:10px;left:10px;z-index:5;background:#fff;padding:10px;border-radius:6px;box-shadow:0 2px 6px rgba(0,0,0,0.3)}
+    button{margin:4px}
+  </style>
+</head>
+<body>
+  <div id="controls">
+    <input id="apiKey" placeholder="PUT_YOUR_GOOGLE_MAPS_API_KEY" style="width:260px"><br>
+    <button id="loadMap">Load map</button>
+    <button id="exportPNG">Export PNG</button>
+    <small>Click any marker to see details. This demo uses geometry & spiderfier libs.</small>
+  </div>
+  <div id="map"></div>
+
+  <!-- libs (CDN) -->
+  <script src="https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/gh/jawj/OverlappingMarkerSpiderfier@gh-pages/bin/oms.min.js"></script>
+
+  <script>
+  // SAMPLE DATA: replace with your CDR export. Keep order = travel sequence.
+  // Each record should have {lat, lng, ts, label} — ts can be timestamp
+  const sampleData = [
+    {lat:28.4212557, lng:77.052968, ts:'2025-09-01T08:00:00', label:'Hotel Formulel (Holiday Inn Express, Sector 50)'},
+    {lat:28.422837, lng:77.0494243, ts:'2025-09-01T09:30:00', label:'Malibu Town (CD-16)'},
+    {lat:28.4212557, lng:77.052968, ts:'2025-09-01T12:00:00', label:'Hotel Formulel (repeat)'},
+    {lat:28.422837, lng:77.0494243, ts:'2025-09-01T15:00:00', label:'Malibu Town (repeat)'},
+    {lat:28.4212557, lng:77.052968, ts:'2025-09-01T18:00:00', label:'Hotel Formulel (repeat)'},
+    {lat:28.4119752, lng:77.0319784, ts:'2025-09-02T09:00:00', label:'Satpal Singh — Fazilpur Jharsa'},
+    {lat:28.429282, lng:77.049594, ts:'2025-09-02T11:30:00', label:'Sector 47, Urban Estate Gurgaon'}
+  ];
+
+  let map, oms, markers = [], polylines = [];
+
+  document.getElementById('loadMap').addEventListener('click', ()=>{
+    const key = document.getElementById('apiKey').value.trim();
+    if(!key){alert('Paste your Google Maps JS API key in the box');return}
+    // dynamically load Google Maps JS with geometry library
+    const s = document.createElement('script');
+    s.src = `https://maps.googleapis.com/maps/api/js?key=${key}&libraries=geometry&callback=initMap`;
+    s.defer = true; s.async = true;
+    document.head.appendChild(s);
+  });
+
+  function initMap(){
+    map = new google.maps.Map(document.getElementById('map'),{
+      zoom:10, center: sampleData[0]
+    });
+
+    // initialize OverlappingMarkerSpiderfier
+    oms = new OverlappingMarkerSpiderfier(map, {markersWontMove:true, markersWontHide:true});
+
+    plotSequence(sampleData);
+  }
+
+  // Core plotting function: keeps visit order, dedupes by exact coords (within epsilon), offsets repeats
+  function plotSequence(data){
+    clearAll();
+
+    // small helper: group exact-same coordinates within epsilon meters
+    const groupKey = (p, epsMeters=10)=>{
+      return `${Math.round(p.lat*1e6)}_${Math.round(p.lng*1e6)}`; // microdegree grouping ~0.1m; change if needed
+    };
+
+    // Build visit list preserving sequence
+    const visits = data.map((d, idx)=>({...d, idx}));
+
+    // Create markers; for repeated identical coords we'll offset using geometry.computeOffset
+    const coordCounts = {}; // key -> count of how many times seen so far
+
+    for(let i=0;i<visits.length;i++){
+      const v = visits[i];
+      const key = groupKey(v);
+      coordCounts[key] = (coordCounts[key]||0) + 1;
+      const repeatIndex = coordCounts[key];
+
+      // if it's a repeat of the same coordinate, create a small offset so markers aren't perfectly stacked
+      let position = new google.maps.LatLng(v.lat, v.lng);
+      if(repeatIndex>1){
+        // compute a tiny offset: distance grows slowly so markers stay near original
+        const distanceMeters = 6 * (repeatIndex-1); // ~6m per repeat (tune as needed)
+        const angle = (repeatIndex-1) * 40 % 360; // spread them by 40 degrees each
+        position = google.maps.geometry.spherical.computeOffset(position, distanceMeters, angle);
+      }
+
+      // create marker with sequence label
+      const marker = new google.maps.Marker({
+        position,
+        map,
+        title:`${v.label || 'visit'} — ${v.ts || ''}`,
+        label: {text: String(i+1), color: 'white', fontSize:'11px'},
+      });
+
+      // attach full info on click
+      const infow = new google.maps.InfoWindow({content:`<b>${v.label||'visit'}</b><br>${v.ts || ''}<br>lat:${v.lat.toFixed(6)}, lng:${v.lng.toFixed(6)}<br>seq:${i+1}`});
+      marker.addListener('click', ()=>infow.open(map, marker));
+
+      markers.push(marker);
+      oms.addMarker(marker);
+    }
+
+    // draw polyline in travel order — but use original coordinates (not jittered positions) so path is accurate
+    const path = visits.map(v=>({lat:v.lat,lng:v.lng}));
+
+    // break into segments; where two consecutive points are identical, create a small loop segment
+    const adjustedPath = [];
+    for(let i=0;i<path.length;i++){
+      const cur = new google.maps.LatLng(path[i]);
+      adjustedPath.push(cur);
+      if(i>0){
+        const prev = new google.maps.LatLng(path[i-1]);
+        const dist = google.maps.geometry.spherical.computeDistanceBetween(prev, cur);
+        if(dist < 2){
+          // zero-length move: insert a tiny loop so arrow is visible
+          const loopPt = google.maps.geometry.spherical.computeOffset(cur, 20, 45); // 20m
+          adjustedPath.push(loopPt);
+          adjustedPath.push(cur);
+        }
+      }
+    }
+
+    // polyline with repeated arrow symbols along path
+    const lineSymbol = {
+      path: google.maps.SymbolPath.FORWARD_CLOSED_ARROW,
+      scale: 3,
+      strokeWeight:0
+    };
+
+    const poly = new google.maps.Polyline({
+      path: adjustedPath,
+      map,
+      strokeColor:'#2b7cff',
+      strokeOpacity:0.8,
+      strokeWeight:2,
+      icons:[{icon: lineSymbol, offset:'100%', repeat:'60px'}] // arrow every 60px
+    });
+    polylines.push(poly);
+
+    // auto fit bounds
+    const bounds = new google.maps.LatLngBounds();
+    markers.forEach(m=>bounds.extend(m.getPosition()));
+    map.fitBounds(bounds);
+  }
+
+  function clearAll(){
+    markers.forEach(m=>m.setMap(null)); markers=[];
+    polylines.forEach(p=>p.setMap(null)); polylines=[];
+  }
+
+  // export map div as png using html2canvas — may be limited by browser security for certain map tiles/styles
+  document.getElementById('exportPNG').addEventListener('click', ()=>{
+    html2canvas(document.getElementById('map'), {useCORS:true, allowTaint:true}).then(canvas=>{
+      const url = canvas.toDataURL('image/png');
+      const a = document.createElement('a'); a.download='map.png'; a.href = url; a.click();
+    }).catch(err=>alert('Export failed. Try zooming the map and re-trying. Note: some map tile providers prevent canvas export.'));
+  });
+
+  </script>
+</body>
+</html>
